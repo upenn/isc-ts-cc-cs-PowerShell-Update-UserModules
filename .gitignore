@@ -1,0 +1,7 @@
+# Log files written by Update-UserModules.ps1
+*.log
+
+# OS / editor clutter
+.DS_Store
+Thumbs.db
+.vscode/
