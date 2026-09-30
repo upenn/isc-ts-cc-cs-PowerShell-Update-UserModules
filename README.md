@@ -1,14 +1,28 @@
 # isc-ts-cc-cs-PowerShell-Update-UserModules
-A simple PowerShell script to update a user's modules, and clean up old versions of the modules.
+A PowerShell module to update a user's modules, and clean up old versions of the modules.
 
-`Update-UserModules.ps1` works on Windows, macOS and Linux. It only touches modules installed with `Install-Module` in the **CurrentUser** scope. Modules installed for all users are left alone.
+The module works on Windows, macOS and Linux and provides two scope-specific commands:
+
+- `Update-CurrentUserModules` manages modules installed in the **CurrentUser** scope.
+- `Update-AllUsersModules` manages modules installed in the **AllUsers** scope and should be run from an elevated PowerShell session.
+
+## Installation
+
+Clone or copy this repository into a module directory, then import the manifest:
+
+```powershell
+Import-Module ./Update-UserModules.psd1
+Get-Command Update-CurrentUserModules, Update-AllUsersModules
+```
+
+The functions are stored in `Functions/` and exported by the module manifest.
 
 ## What it does
 
-1. **Update:** checks the repository (PSGallery by default) for a newer version of each user-scope module and installs it.
+1. **Update:** checks the repository (PSGallery by default) for a newer version of each module in the selected scope and installs it.
 2. **Clean up:** keeps the newest version of each module plus a set number of older versions (default 1, so versions *n* and *n-1*), and uninstalls the rest.
 
-Every action is written to a log file. By default the script prints nothing to the console.
+Every action is written to a log file. By default the commands print nothing to the console.
 
 ## Requirements
 
@@ -19,7 +33,7 @@ Every action is written to a log file. By default the script prints nothing to t
 
 | Parameter | Default | Description |
 |---|---|---|
-| `-LogPath` | `./Update-UserModules_<yyyyMMdd-HHmmss>.log` | Log file path. If you give a folder, the default file name is created inside it. |
+| `-LogPath` | `./<CommandName>_<yyyyMMdd-HHmmss>.log` | Log file path. If you give a folder, the default file name is created inside it. |
 | `-KeepVersions` | `1` | Number of older versions to keep alongside the newest. `0` keeps only the newest. |
 | `-CleanupOnly` | off | Skip the update step and only remove old versions. |
 | `-Name` | `*` | Module name filter; wildcards allowed. |
@@ -32,16 +46,22 @@ Every action is written to a log file. By default the script prints nothing to t
 
 ```powershell
 # Update everything, keep n and n-1, log to the current folder, no console output
-./Update-UserModules.ps1
+Update-CurrentUserModules
 
 # Preview what would be updated and removed
-./Update-UserModules.ps1 -WhatIf -Verbose
+Update-CurrentUserModules -WhatIf -Verbose
 
 # Only remove old versions, keeping just the newest
-./Update-UserModules.ps1 -CleanupOnly -KeepVersions 0
+Update-CurrentUserModules -CleanupOnly -KeepVersions 0
 
 # Limit to specific modules and log to another folder
-./Update-UserModules.ps1 -Name Microsoft.Graph*, ExchangeOnlineManagement -LogPath ~/Logs -Verbose
+Update-CurrentUserModules -Name Microsoft.Graph*, ExchangeOnlineManagement -LogPath ~/Logs -Verbose
+
+# Preview updates and cleanup for modules installed for all users
+Update-AllUsersModules -WhatIf -Verbose
+
+# Update and clean up all-users modules (run PowerShell elevated)
+Update-AllUsersModules
 ```
 
 ## Log format
@@ -49,7 +69,7 @@ Every action is written to a log file. By default the script prints nothing to t
 Syslog-style lines with an ISO 8601 timestamp:
 
 ```
-2026-09-21T08:59:43-04:00 myhost Update-UserModules[2372]: notice: Removed FakeMod 1.2.0
+2026-09-21T08:59:43-04:00 myhost Update-CurrentUserModules[2372]: notice: Removed FakeMod 1.2.0
 ```
 
 | Severity | Meaning |
@@ -67,12 +87,20 @@ Syslog-style lines with an ISO 8601 timestamp:
 | Windows (PowerShell 7+) | `<Documents>\PowerShell\Modules` |
 | macOS / Linux | `$XDG_DATA_HOME/powershell/Modules` (default `~/.local/share/powershell/Modules`) |
 
-## Exit codes
+AllUsers module locations:
 
-- `0`: every action succeeded (or there was nothing to do)
-- `1`: at least one update or removal failed; see the log for details
+| Platform | Path |
+|---|---|
+| Windows (PowerShell 5.1) | `$env:ProgramFiles\WindowsPowerShell\Modules` |
+| Windows (PowerShell 7+) | `$env:ProgramFiles\PowerShell\Modules` |
+| macOS / Linux | `/usr/local/share/powershell/Modules` |
+
+## Errors
+
+The commands throw a terminating error when a required PowerShellGet command is unavailable or when one or more update/removal operations fail. See the generated log for details.
 
 ## Notes
 
 - A module version that's loaded in any open PowerShell session may fail to uninstall. Run from a fresh session (`pwsh -NoProfile`) for best results.
-- On macOS/Linux, don't run the script with `sudo`. That switches `$HOME` to root's, so root's modules would be cleaned up instead of yours.
+- On macOS/Linux, don't run `Update-CurrentUserModules` with `sudo`. That switches `$HOME` to root's, so root's modules would be targeted instead of yours.
+- Run `Update-AllUsersModules` in an elevated session (Run as Administrator on Windows or through `sudo pwsh` on macOS/Linux).

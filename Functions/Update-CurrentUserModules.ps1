@@ -1,72 +1,17 @@
-<#
-.SYNOPSIS
-    Updates PowerShell modules installed in the CurrentUser scope, then removes older versions.
-
-.DESCRIPTION
-    Phase 1 - Update: finds every module installed (via PowerShellGet) under the current user's
-    module path, checks the gallery for a newer version, and updates it.
-
-    Phase 2 - Cleanup: for each of those modules, keeps the newest version plus the number of
-    older versions given by -KeepVersions, and uninstalls the rest.
-
-    Every action is written to a log file. By default the script writes nothing to the console;
-    use -Verbose to echo log entries to the screen, and -WhatIf to see what would happen without
-    changing anything (WhatIf actions are still logged, prefixed "WhatIf:").
-
-    Log lines use a syslog style format with an ISO 8601 (RFC 5424) timestamp:
-      2026-09-21T08:57:08-04:00 hostname Update-UserModules[4242]: notice: Updated Pester 5.6.1 -> 5.7.1
-    Severities: info, notice (changes made / WhatIf), warning, err.
-
-.PARAMETER LogPath
-    Log file path. Defaults to Update-UserModules_<yyyyMMdd-HHmmss>.log in the current directory.
-    If a directory is given, the default file name is created inside it.
-
-.PARAMETER KeepVersions
-    Number of older versions to keep in addition to the current (newest) version.
-    Default 1 = keep version n and n-1. Use 0 to keep only the newest.
-
-.PARAMETER Name
-    Optional module name filter (wildcards allowed). Defaults to all user-scope modules.
-
-.PARAMETER Repository
-    Repository to check for updates. Defaults to PSGallery.
-
-.PARAMETER CleanupOnly
-    Skip the update phase and only remove old versions (no repository access needed).
-
-.EXAMPLE
-    .\Update-UserModules.ps1
-    Updates all user modules, keeps n and n-1, logs to the current directory, no console output.
-
-.EXAMPLE
-    .\Update-UserModules.ps1 -WhatIf -Verbose
-    Shows and logs what would be updated and removed, without making changes.
-
-.EXAMPLE
-    .\Update-UserModules.ps1 -KeepVersions 0 -LogPath C:\Logs
-    Keeps only the newest version of each module and logs to C:\Logs.
-
-.EXAMPLE
-    .\Update-UserModules.ps1 -CleanupOnly -WhatIf -Verbose
-    Shows which old versions would be removed, without checking for or installing updates.
-
-.EXAMPLE
-    .\Update-UserModules.ps1 -Name Microsoft.Graph*, ExchangeOnlineManagement -Verbose
-
-.NOTES
-    Requires PowerShellGet (Get-InstalledModule / Update-Module / Uninstall-Module).
-    Runs on Windows (Windows PowerShell 5.1 and PowerShell 7+), macOS, and Linux (PowerShell 7+).
-    User-scope module locations:
-      Windows : <Documents>\WindowsPowerShell\Modules and <Documents>\PowerShell\Modules
-      macOS/Linux : $XDG_DATA_HOME/powershell/Modules (default ~/.local/share/powershell/Modules)
-    On macOS/Linux, don't run with sudo - $HOME becomes root's and root's modules are targeted.
-    Only modules installed with Install-Module in the CurrentUser scope are touched.
-    A module version that is loaded in any running session may fail to uninstall; run from a
-    fresh session (pwsh -NoProfile) for best results. Failures are logged and the script
-    exits with code 1 if any action failed.
-#>
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+# Shared implementation for the exported CurrentUser and AllUsers commands.
+function Invoke-ModuleMaintenance {
+    [CmdletBinding()]
 param(
+    [Parameter(Mandatory)]
+    [ValidateSet('CurrentUser', 'AllUsers')]
+    [string]$Scope,
+
+    [Parameter(Mandatory)]
+    [string]$CommandName,
+
+    [Parameter(Mandatory)]
+    [System.Management.Automation.PSCmdlet]$CallerPSCmdlet,
+
     [Parameter()]
     [string]$LogPath,
 
@@ -86,11 +31,11 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:FailureCount = 0
+$failureCount = 0
 
 #region Logging ---------------------------------------------------------------------------------
 
-$defaultLogName = 'Update-UserModules_{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss')
+$defaultLogName = '{0}_{1}.log' -f $CommandName, (Get-Date -Format 'yyyyMMdd-HHmmss')
 if ([string]::IsNullOrWhiteSpace($LogPath)) {
     $LogPath = Join-Path -Path (Get-Location).ProviderPath -ChildPath $defaultLogName
 }
@@ -106,10 +51,10 @@ if ($logDir -and -not (Test-Path -LiteralPath $logDir)) {
 }
 
 # Syslog-style log lines with an RFC 5424 (ISO 8601) timestamp:
-#   2026-09-21T08:57:08-04:00 hostname Update-UserModules[4242]: <severity>: message
-$script:LogHost = ([Environment]::MachineName -split '\.')[0]
-$script:LogTag  = '{0}[{1}]' -f [IO.Path]::GetFileNameWithoutExtension($PSCommandPath), $PID
-$script:Invariant = [Globalization.CultureInfo]::InvariantCulture
+#   2026-09-21T08:57:08-04:00 hostname Update-CurrentUserModules[4242]: <severity>: message
+$logHost = ([Environment]::MachineName -split '\.')[0]
+$logTag  = '{0}[{1}]' -f $CommandName, $PID
+$invariant = [Globalization.CultureInfo]::InvariantCulture
 
 function Write-Log {
     param(
@@ -128,8 +73,8 @@ function Write-Log {
 
     $now = Get-Date
     # ISO 8601 / RFC 5424 timestamp with UTC offset, e.g. 2026-09-21T08:58:44-04:00
-    $stamp = $now.ToString('yyyy-MM-ddTHH:mm:sszzz', $script:Invariant)
-    $line  = '{0} {1} {2}: {3}: {4}' -f $stamp, $script:LogHost, $script:LogTag, $severity, $Message
+    $stamp = $now.ToString('yyyy-MM-ddTHH:mm:sszzz', $invariant)
+    $line  = '{0} {1} {2}: {3}: {4}' -f $stamp, $logHost, $logTag, $severity, $Message
     Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 -WhatIf:$false -Confirm:$false
     Write-Verbose $line
 }
@@ -139,44 +84,65 @@ function Write-Log {
 #region Helpers ---------------------------------------------------------------------------------
 
 # Platform detection that also works on Windows PowerShell 5.1 (where $IsWindows doesn't exist).
-$script:OnWindows = ($PSVersionTable.PSEdition -eq 'Desktop') -or
+$onWindows = ($PSVersionTable.PSEdition -eq 'Desktop') -or
                     ((Get-Variable -Name IsWindows -ValueOnly -ErrorAction SilentlyContinue) -eq $true)
-$script:OnMacOS   = (Get-Variable -Name IsMacOS -ValueOnly -ErrorAction SilentlyContinue) -eq $true
+$onMacOS   = (Get-Variable -Name IsMacOS -ValueOnly -ErrorAction SilentlyContinue) -eq $true
 # Windows and (default) macOS file systems are case-insensitive; Linux is case-sensitive.
-$script:PathComparison = if ($script:OnWindows -or $script:OnMacOS) {
+$pathComparison = if ($onWindows -or $onMacOS) {
     [StringComparison]::OrdinalIgnoreCase
 } else {
     [StringComparison]::Ordinal
 }
 
-function Get-UserModuleRoots {
-    # Resolve the CurrentUser module folder(s) for the current platform/edition.
+function Get-ScopedModuleRoots {
+    # Resolve the standard module folder(s) for the requested scope and platform/edition.
     $roots = [System.Collections.Generic.List[string]]::new()
 
-    if ($script:OnWindows) {
-        $docs = [Environment]::GetFolderPath('MyDocuments')   # honours OneDrive/folder redirection
-        if ($docs) {
-            $roots.Add((Join-Path (Join-Path $docs 'WindowsPowerShell') 'Modules'))  # Windows PowerShell 5.1
-            $roots.Add((Join-Path (Join-Path $docs 'PowerShell') 'Modules'))         # PowerShell 7+
+    if ($Scope -eq 'CurrentUser') {
+        if ($onWindows) {
+            $docs = [Environment]::GetFolderPath('MyDocuments')   # honours OneDrive/folder redirection
+            if ($docs) {
+                $roots.Add((Join-Path (Join-Path $docs 'WindowsPowerShell') 'Modules'))  # Windows PowerShell 5.1
+                $roots.Add((Join-Path (Join-Path $docs 'PowerShell') 'Modules'))         # PowerShell 7+
+            }
+        }
+        else {
+            # macOS / Linux: PowerShell follows XDG_DATA_HOME, defaulting to ~/.local/share
+            $dataHome = if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { Join-Path (Join-Path $HOME '.local') 'share' }
+            $roots.Add((Join-Path (Join-Path $dataHome 'powershell') 'Modules'))
+        }
+
+        # Custom user module paths under the home directory also count as CurrentUser scope.
+        foreach ($p in ($env:PSModulePath -split [IO.Path]::PathSeparator)) {
+            if ($p -and $p.StartsWith($HOME, $pathComparison)) { $roots.Add($p) }
         }
     }
     else {
-        # macOS / Linux: PowerShell follows XDG_DATA_HOME, defaulting to ~/.local/share
-        $dataHome = if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { Join-Path (Join-Path $HOME '.local') 'share' }
-        $roots.Add((Join-Path (Join-Path $dataHome 'powershell') 'Modules'))
+        if ($onWindows) {
+            if ($env:ProgramFiles) {
+                $roots.Add((Join-Path (Join-Path $env:ProgramFiles 'WindowsPowerShell') 'Modules'))
+                $roots.Add((Join-Path (Join-Path $env:ProgramFiles 'PowerShell') 'Modules'))
+            }
+        }
+        else {
+            $roots.Add('/usr/local/share/powershell/Modules')
+        }
     }
 
-    # Anything in PSModulePath that lives under the user's home directory also counts as user scope.
-    foreach ($p in ($env:PSModulePath -split [IO.Path]::PathSeparator)) {
-        if ($p -and $p.StartsWith($HOME, $script:PathComparison)) { $roots.Add($p) }
-    }
     $roots | ForEach-Object { $_.TrimEnd('\', '/') } | Where-Object { $_ } | Select-Object -Unique
 }
 
-function Test-IsUserScope {
+function Test-IsRequestedScope {
     param([string]$Path, [string[]]$Roots)
     foreach ($r in $Roots) {
-        if ($Path -and $Path.StartsWith($r, $script:PathComparison)) { return $true }
+        if (-not $Path) { continue }
+
+        $normalizedRoot = $r.TrimEnd('\', '/')
+        if ($Path.Equals($normalizedRoot, $pathComparison) -or
+            $Path.StartsWith("$normalizedRoot$([IO.Path]::DirectorySeparatorChar)", $pathComparison) -or
+            $Path.StartsWith("$normalizedRoot$([IO.Path]::AltDirectorySeparatorChar)", $pathComparison)) {
+            return $true
+        }
     }
     return $false
 }
@@ -216,9 +182,9 @@ function Compare-ModuleVersion {
 #region Main ------------------------------------------------------------------------------------
 
 $modeText = if ($WhatIfPreference) { 'WhatIf' } else { 'Live' }
-Write-Log "===== Update-UserModules started (Mode: $modeText, CleanupOnly: $([bool]$CleanupOnly), KeepVersions: $KeepVersions, Name: $($Name -join ', ')) ====="
+Write-Log "===== $CommandName started (Scope: $Scope, Mode: $modeText, CleanupOnly: $([bool]$CleanupOnly), KeepVersions: $KeepVersions, Name: $($Name -join ', ')) ====="
 Write-Log "Log file: $LogPath"
-$platform = if ($script:OnWindows) { 'Windows' } elseif ($script:OnMacOS) { 'macOS' } else { 'Linux' }
+$platform = if ($onWindows) { 'Windows' } elseif ($onMacOS) { 'macOS' } else { 'Linux' }
 Write-Log "PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) on $platform as $([Environment]::UserName)"
 
 $requiredCommands = if ($CleanupOnly) { 'Get-InstalledModule', 'Uninstall-Module' }
@@ -226,14 +192,14 @@ $requiredCommands = if ($CleanupOnly) { 'Get-InstalledModule', 'Uninstall-Module
 foreach ($cmd in $requiredCommands) {
     if (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
         Write-Log "Required command '$cmd' not found. Install/import PowerShellGet and retry." -Level ERROR
-        exit 1
+        throw "Required command '$cmd' not found. Install/import PowerShellGet and retry."
     }
 }
 
-$userRoots = @(Get-UserModuleRoots)
-Write-Log "User module roots: $($userRoots -join '; ')"
+$scopeRoots = @(Get-ScopedModuleRoots)
+Write-Log "$Scope module roots: $($scopeRoots -join '; ')"
 
-# Gather every installed version, then keep only those under a user-scope path.
+# Gather every installed version, then keep only those under a path for the requested scope.
 try {
     # -AllVersions can't be combined with wildcards, so get names first, then versions per module.
     $installedNames = @(Get-InstalledModule -Name $Name -ErrorAction SilentlyContinue -Verbose:$false |
@@ -244,24 +210,24 @@ try {
 }
 catch {
     Write-Log "Failed to enumerate installed modules: $($_.Exception.Message)" -Level ERROR
-    exit 1
+    throw "$CommandName could not enumerate installed modules. See the log at '$LogPath'."
 }
 
-$userInstalled = @($allInstalled | Where-Object { Test-IsUserScope -Path $_.InstalledLocation -Roots $userRoots })
-if ($userInstalled.Count -eq 0) {
-    Write-Log 'No user-scope modules installed via PowerShellGet matched the filter. Nothing to do.'
+$scopeInstalled = @($allInstalled | Where-Object { Test-IsRequestedScope -Path $_.InstalledLocation -Roots $scopeRoots })
+if ($scopeInstalled.Count -eq 0) {
+    Write-Log "No $Scope modules installed via PowerShellGet matched the filter. Nothing to do."
     Write-Log '===== Finished ====='
-    exit 0
+    return
 }
 
 # Map: module name -> list of installed version strings
 $versionMap = @{}
-foreach ($m in $userInstalled) {
+foreach ($m in $scopeInstalled) {
     if (-not $versionMap.ContainsKey($m.Name)) { $versionMap[$m.Name] = [System.Collections.Generic.List[string]]::new() }
     $versionMap[$m.Name].Add([string]$m.Version)
 }
 $moduleNames = @($versionMap.Keys | Sort-Object)
-Write-Log "Found $($moduleNames.Count) user-scope module(s) ($($userInstalled.Count) installed version(s))."
+Write-Log "Found $($moduleNames.Count) $Scope module(s) ($($scopeInstalled.Count) installed version(s))."
 
 # ---- Phase 1: Update ---------------------------------------------------------------------------
 $updated = 0
@@ -296,7 +262,7 @@ else {
         }
 
         $target = "$modName $current -> $latest"
-        if ($PSCmdlet.ShouldProcess($target, 'Update module')) {
+        if ($CallerPSCmdlet.ShouldProcess($target, "Update $Scope module")) {
             try {
                 $params = @{
                     Name            = $modName
@@ -306,7 +272,7 @@ else {
                     ErrorAction     = 'Stop'
                     Verbose         = $false
                 }
-                if ($updateSupportsScope) { $params.Scope = 'CurrentUser' }
+                if ($updateSupportsScope) { $params.Scope = $Scope }
                 Update-Module @params | Out-Null
                 Write-Log "Updated $target" -Level ACTION
                 $versionMap[$modName].Add($latest)
@@ -314,7 +280,7 @@ else {
             }
             catch {
                 Write-Log "Failed to update $target : $($_.Exception.Message)" -Level ERROR
-                $script:FailureCount++
+                $failureCount++
             }
         }
         else {
@@ -346,7 +312,7 @@ foreach ($modName in $moduleNames) {
 
     foreach ($ver in $remove) {
         $target = "$modName $ver"
-        if ($PSCmdlet.ShouldProcess($target, 'Uninstall module version')) {
+        if ($CallerPSCmdlet.ShouldProcess($target, "Uninstall $Scope module version")) {
             try {
                 $params = @{
                     Name            = $modName
@@ -364,7 +330,7 @@ foreach ($modName in $moduleNames) {
             }
             catch {
                 Write-Log "Failed to remove $target : $($_.Exception.Message)" -Level ERROR
-                $script:FailureCount++
+                $failureCount++
             }
         }
         else {
@@ -375,8 +341,50 @@ foreach ($modName in $moduleNames) {
 }
 Write-Log "Cleanup phase complete: $removed version(s) $(if ($WhatIfPreference) { 'would be ' })removed."
 
-Write-Log "===== Finished. Updated: $updated, Removed: $removed, Failures: $($script:FailureCount) ====="
+Write-Log "===== Finished. Updated: $updated, Removed: $removed, Failures: $failureCount ====="
 
-if ($script:FailureCount -gt 0) { exit 1 } else { exit 0 }
+if ($failureCount -gt 0) {
+    throw "$CommandName completed with $failureCount failure(s). See the log at '$LogPath'."
+}
 
 #endregion
+}
+
+function Update-CurrentUserModules {
+    <#
+    .SYNOPSIS
+        Updates CurrentUser PowerShell modules and removes older versions.
+    .DESCRIPTION
+        Updates modules installed via PowerShellGet in the CurrentUser scope, then keeps the
+        newest version plus the number of older versions selected with KeepVersions.
+    .PARAMETER LogPath
+        Log file path. Defaults to Update-CurrentUserModules_<yyyyMMdd-HHmmss>.log in the current
+        directory. If a directory is given, the default file name is created inside it.
+    .PARAMETER KeepVersions
+        Number of older versions to keep in addition to the newest version. Defaults to 1.
+    .PARAMETER Name
+        Optional module name filter. Wildcards are supported. Defaults to all modules.
+    .PARAMETER Repository
+        Repository to check for updates. Defaults to PSGallery.
+    .PARAMETER CleanupOnly
+        Skips repository checks and only removes old versions.
+    .EXAMPLE
+        Update-CurrentUserModules -WhatIf -Verbose
+        Previews CurrentUser module updates and removals.
+    .EXAMPLE
+        Update-CurrentUserModules -CleanupOnly -KeepVersions 0
+        Keeps only the newest CurrentUser version of each module.
+    #>
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+    param(
+        [Parameter()][string]$LogPath,
+        [Parameter()][ValidateRange(0, 100)][int]$KeepVersions = 1,
+        [Parameter()][string[]]$Name = '*',
+        [Parameter()][string]$Repository = 'PSGallery',
+        [Parameter()][switch]$CleanupOnly
+    )
+
+    Invoke-ModuleMaintenance -Scope CurrentUser -CommandName $MyInvocation.MyCommand.Name `
+        -CallerPSCmdlet $PSCmdlet -LogPath $LogPath -KeepVersions $KeepVersions -Name $Name `
+        -Repository $Repository -CleanupOnly:$CleanupOnly
+}
