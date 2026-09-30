@@ -1,4 +1,4 @@
-# Log files written by Update-UserModules.ps1
+# Log files written by Update-UserModules module commands
 *.log
 
 # OS / editor clutter
