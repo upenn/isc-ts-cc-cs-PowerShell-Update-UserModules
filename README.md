@@ -98,10 +98,10 @@ AllUsers module locations:
 
 ## Errors
 
-The commands throw a terminating error when a required PowerShellGet command is unavailable or when one or more update/removal operations fail. See the generated log for details.
+The commands throw a terminating error when a required PowerShellGet command is unavailable, when `Update-AllUsersModules` is run without elevation (except with `-WhatIf`), or when one or more update/removal operations fail. See the generated log for details.
 
 ## Notes
 
 - A module version that's loaded in any open PowerShell session may fail to uninstall. Run from a fresh session (`pwsh -NoProfile`) for best results.
 - On macOS/Linux, don't run `Update-CurrentUserModules` with `sudo`. That switches `$HOME` to root's, so root's modules would be targeted instead of yours.
-- Run `Update-AllUsersModules` in an elevated session (Run as Administrator on Windows or through `sudo pwsh` on macOS/Linux).
+- Run `Update-AllUsersModules` in an elevated session (Run as Administrator on Windows or through `sudo pwsh` on macOS/Linux). Without elevation it stops before changing anything; `-WhatIf` previews work without elevation.
