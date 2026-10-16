@@ -185,7 +185,12 @@ function Get-ManifestRequirements {
     $entries = $null
     if ($Module.Path -and $Module.Path.EndsWith('.psd1', [StringComparison]::OrdinalIgnoreCase)) {
         try { $entries = (Import-PowerShellDataFile -LiteralPath $Module.Path -ErrorAction Stop).RequiredModules }
-        catch { $entries = $null }
+        catch {
+            # The parser error can quote the whole manifest; log only the reason.
+            $reason = (($_.Exception.Message -split '\r?\n')[0] -replace '\s*Dynamic expression:.*$', '').TrimEnd('.', ' ', ':')
+            Write-Log "Couldn't read the manifest of $($Module.Name) $($Module.Version) ($($Module.Path)): $reason. Using the RequiredModules that Get-Module reports instead." -Level WARN
+            $entries = $null
+        }
     }
     if ($null -eq $entries) {
         # Manifest couldn't be read as data: fall back to what Get-Module reports and treat any
