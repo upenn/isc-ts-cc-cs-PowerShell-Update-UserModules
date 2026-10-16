@@ -177,6 +177,69 @@ function Compare-ModuleVersion {
     return ($sorted[0] -eq $Candidate -and $Candidate -ne $Current)
 }
 
+function Get-ManifestRequirements {
+    # Returns the RequiredModules entries of a manifest as objects with Name, RequiredVersion,
+    # MinimumVersion and MaximumVersion ($null when not set).
+    param([System.Management.Automation.PSModuleInfo]$Module)
+
+    $entries = $null
+    if ($Module.Path -and $Module.Path.EndsWith('.psd1', [StringComparison]::OrdinalIgnoreCase)) {
+        try { $entries = (Import-PowerShellDataFile -LiteralPath $Module.Path -ErrorAction Stop).RequiredModules }
+        catch {
+            # The parser error can quote the whole manifest; log only the reason.
+            $reason = (($_.Exception.Message -split '\r?\n')[0] -replace '\s*Dynamic expression:.*$', '').TrimEnd('.', ' ', ':')
+            Write-Log "Couldn't read the manifest of $($Module.Name) $($Module.Version) ($($Module.Path)): $reason. Using the RequiredModules that Get-Module reports instead." -Level WARN
+            $entries = $null
+        }
+    }
+    if ($null -eq $entries) {
+        # Manifest couldn't be read as data: fall back to what Get-Module reports and treat any
+        # version it gives as exact, so we err on the side of keeping the dependency.
+        foreach ($r in $Module.RequiredModules) {
+            $exact = if ($r.Version -and $r.Version -ne [version]'0.0') { $r.Version } else { $null }
+            [pscustomobject]@{ Name = $r.Name; RequiredVersion = $exact; MinimumVersion = $null; MaximumVersion = $null }
+        }
+        return
+    }
+
+    foreach ($e in @($entries)) {
+        if ($e -is [string]) {
+            [pscustomobject]@{ Name = $e; RequiredVersion = $null; MinimumVersion = $null; MaximumVersion = $null }
+        }
+        elseif ($e -is [hashtable] -and $e.ContainsKey('ModuleName')) {
+            [pscustomobject]@{
+                Name            = [string]$e['ModuleName']
+                RequiredVersion = if ($e['RequiredVersion']) { (Get-VersionSortKey ([string]$e['RequiredVersion'])).Base } else { $null }
+                MinimumVersion  = if ($e['ModuleVersion'])   { (Get-VersionSortKey ([string]$e['ModuleVersion'])).Base } else { $null }
+                # MaximumVersion may use a wildcard, e.g. '2.*'
+                MaximumVersion  = if ($e['MaximumVersion'])  { (Get-VersionSortKey (([string]$e['MaximumVersion']) -replace '\*', '2147483647')).Base } else { $null }
+            }
+        }
+    }
+}
+
+function Test-RequirementSatisfied {
+    param($Requirement, [version]$Version)
+    if ($Requirement.RequiredVersion) { return ($Version -eq $Requirement.RequiredVersion) }
+    if ($Requirement.MinimumVersion -and $Version -lt $Requirement.MinimumVersion) { return $false }
+    if ($Requirement.MaximumVersion -and $Version -gt $Requirement.MaximumVersion) { return $false }
+    return $true
+}
+
+function Get-DependencyIndex {
+    # From the available modules, lists every module version that requires one of $Names,
+    # with its parsed requirements on those modules.
+    param([System.Management.Automation.PSModuleInfo[]]$Available, [string[]]$Names)
+    $Available |
+        Where-Object { $_.RequiredModules | Where-Object { $Names -contains $_.Name } } |
+        ForEach-Object {
+            $reqs = @(Get-ManifestRequirements -Module $_ | Where-Object { $Names -contains $_.Name })
+            if ($reqs.Count -gt 0) {
+                [pscustomobject]@{ Name = $_.Name; Version = $_.Version; Requirements = $reqs }
+            }
+        }
+}
+
 #endregion
 
 #region Main ------------------------------------------------------------------------------------
@@ -238,12 +301,22 @@ else {
     Write-Log '----- Phase 1: Update -----'
 
     $galleryLatest = @{}
-    try {
-        Find-Module -Name $moduleNames -Repository $Repository -ErrorAction SilentlyContinue -Verbose:$false |
-            ForEach-Object { $galleryLatest[$_.Name] = [string]$_.Version }
-    }
-    catch {
-        Write-Log "Gallery lookup failed: $($_.Exception.Message)" -Level WARN
+    # Find-Module rejects more than 63 names per call, so look them up in batches.
+    $batchSize = 50
+    for ($i = 0; $i -lt $moduleNames.Count; $i += $batchSize) {
+        $batch = $moduleNames[$i..([Math]::Min($i + $batchSize, $moduleNames.Count) - 1)]
+        try {
+            $findErrors = $null
+            Find-Module -Name $batch -Repository $Repository -ErrorAction SilentlyContinue -ErrorVariable findErrors -Verbose:$false |
+                ForEach-Object { $galleryLatest[$_.Name] = [string]$_.Version }
+            # "No match was found" just means a module isn't in the repository; report anything else.
+            foreach ($e in @($findErrors | Where-Object { $_.FullyQualifiedErrorId -notlike 'NoMatchFoundForCriteria*' })) {
+                Write-Log "Gallery lookup failed: $($e.Exception.Message)" -Level WARN
+            }
+        }
+        catch {
+            Write-Log "Gallery lookup failed: $($_.Exception.Message)" -Level WARN
+        }
     }
 
     $updateSupportsScope = (Get-Command Update-Module).Parameters.ContainsKey('Scope')
@@ -298,7 +371,10 @@ Write-Log "----- Phase 2: Remove old versions (keeping newest + $KeepVersions) -
 
 $keepCount = $KeepVersions + 1
 $removed = 0
+$skipped = 0
 
+# Plan every removal first so dependencies can be checked across modules.
+$pending = [System.Collections.Generic.List[object]]::new()
 foreach ($modName in $moduleNames) {
     $sorted = @(Sort-VersionsDescending -Versions ($versionMap[$modName] | Select-Object -Unique))
     if ($sorted.Count -le $keepCount) {
@@ -309,39 +385,105 @@ foreach ($modName in $moduleNames) {
     $keep = $sorted[0..($keepCount - 1)]
     $remove = $sorted[$keepCount..($sorted.Count - 1)]
     Write-Log "$modName - keeping: $($keep -join ', '); removing: $($remove -join ', ')"
-
     foreach ($ver in $remove) {
-        $target = "$modName $ver"
+        $pending.Add([pscustomobject]@{ Name = $modName; Version = $ver; Base = (Get-VersionSortKey $ver).Base })
+    }
+}
+
+if ($pending.Count -gt 0) {
+    # PowerShellGet refuses to uninstall any version of a module that another installed module
+    # requires, whatever versions are involved (e.g. old Microsoft.Graph.Authentication versions
+    # while any Microsoft.Graph.* module is installed). So check dependencies per version here,
+    # and only remove a version no remaining module needs, using -Force to skip that name-only check.
+    $pendingNames = @($pending | Select-Object -ExpandProperty Name -Unique)
+    $available = @(Get-Module -ListAvailable -Verbose:$false -ErrorAction SilentlyContinue)
+    $dependents = @(Get-DependencyIndex -Available $available -Names $pendingNames)
+
+    # Every version of each pending module that is (or, under WhatIf, would be) installed.
+    $knownVersions = @{}
+    foreach ($n in $pendingNames) {
+        $knownVersions[$n] = @(@($available | Where-Object { $_.Name -eq $n } | ForEach-Object { $_.Version }) +
+                               @($versionMap[$n] | ForEach-Object { (Get-VersionSortKey $_).Base }) | Select-Object -Unique)
+    }
+
+    $gone = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $keyOf = { param($n, $v) '{0}|{1}' -f $n, $v }
+    $uninstallSupportsPrerelease = (Get-Command Uninstall-Module).Parameters.ContainsKey('AllowPrerelease')
+
+    while ($pending.Count -gt 0) {
+        # Remove dependents before what they depend on: take a version no other pending version needs.
+        # If every one is needed (a dependency cycle), just take the first.
+        $next = $pending | Where-Object {
+            $c = $_
+            -not ($dependents | Where-Object {
+                $d = $_
+                $d.Name -ne $c.Name -and
+                ($pending | Where-Object { $_.Name -eq $d.Name -and $_.Base -eq $d.Version }) -and
+                ($d.Requirements | Where-Object { $_.Name -eq $c.Name -and (Test-RequirementSatisfied $_ $c.Base) })
+            })
+        } | Select-Object -First 1
+        if (-not $next) { $next = $pending[0] }
+        [void]$pending.Remove($next)
+
+        $target = "$($next.Name) $($next.Version)"
+
+        # Which remaining module versions need this exact version, with no other version to fall back on?
+        $others = @($knownVersions[$next.Name] | Where-Object { $_ -ne $next.Base -and -not $gone.Contains((& $keyOf $next.Name $_)) })
+        $blockers = @($dependents | Where-Object {
+            $d = $_
+            $d.Name -ne $next.Name -and -not $gone.Contains((& $keyOf $d.Name $d.Version)) -and
+            ($d.Requirements | Where-Object {
+                $r = $_
+                $r.Name -eq $next.Name -and (Test-RequirementSatisfied $r $next.Base) -and
+                -not ($others | Where-Object { Test-RequirementSatisfied $r $_ })
+            })
+        } | ForEach-Object { "$($_.Name) $($_.Version)" } | Select-Object -Unique)
+
+        if ($blockers.Count -gt 0) {
+            Write-Log "Keeping $target - required by $($blockers -join ', ')." -Level WARN
+            $skipped++
+            continue
+        }
+
         if ($CallerPSCmdlet.ShouldProcess($target, "Uninstall $Scope module version")) {
             try {
                 $params = @{
-                    Name            = $modName
-                    RequiredVersion = $ver
+                    Name            = $next.Name
+                    RequiredVersion = $next.Version
+                    Force           = $true   # dependencies were checked above
                     Confirm         = $false
                     ErrorAction     = 'Stop'
                     Verbose         = $false
                 }
-                if ($ver -match '-' -and (Get-Command Uninstall-Module).Parameters.ContainsKey('AllowPrerelease')) {
+                if ($next.Version -match '-' -and $uninstallSupportsPrerelease) {
                     $params.AllowPrerelease = $true
                 }
                 Uninstall-Module @params
                 Write-Log "Removed $target" -Level ACTION
+                [void]$gone.Add((& $keyOf $next.Name $next.Base))
                 $removed++
             }
             catch {
-                Write-Log "Failed to remove $target : $($_.Exception.Message)" -Level ERROR
-                $failureCount++
+                if ($_.FullyQualifiedErrorId -like 'ModuleIsInUse*') {
+                    Write-Log "Skipped $target - it is loaded in a PowerShell session. Close sessions using it and run again." -Level WARN
+                    $skipped++
+                }
+                else {
+                    Write-Log "Failed to remove $target : $($_.Exception.Message)" -Level ERROR
+                    $failureCount++
+                }
             }
         }
         else {
             Write-Log "Would remove $target" -Level WHATIF
+            [void]$gone.Add((& $keyOf $next.Name $next.Base))
             $removed++
         }
     }
 }
-Write-Log "Cleanup phase complete: $removed version(s) $(if ($WhatIfPreference) { 'would be ' })removed."
+Write-Log "Cleanup phase complete: $removed version(s) $(if ($WhatIfPreference) { 'would be ' })removed, $skipped kept or skipped."
 
-Write-Log "===== Finished. Updated: $updated, Removed: $removed, Failures: $failureCount ====="
+Write-Log "===== Finished. Updated: $updated, Removed: $removed, Skipped: $skipped, Failures: $failureCount ====="
 
 if ($failureCount -gt 0) {
     throw "$CommandName completed with $failureCount failure(s). See the log at '$LogPath'."

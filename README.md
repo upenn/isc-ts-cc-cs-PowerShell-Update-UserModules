@@ -21,6 +21,7 @@ The functions are stored in `Functions/` and exported by the module manifest.
 
 1. **Update:** checks the repository (PSGallery by default) for a newer version of each module in the selected scope and installs it.
 2. **Clean up:** keeps the newest version of each module plus a set number of older versions (default 1, so versions *n* and *n-1*), and uninstalls the rest.
+   An old version is kept, with a warning in the log, if another installed module still needs that exact version (for example a module that pins `RequiredVersion` of a dependency). Dependents are removed before the modules they depend on, so old `Microsoft.Graph.*` sets clean up in one run. A version that's loaded in a running PowerShell session is skipped with a warning.
 
 Every action is written to a log file. By default the commands print nothing to the console.
 
@@ -76,7 +77,7 @@ Syslog-style lines with an ISO 8601 timestamp:
 |---|---|
 | `info` | Progress and status |
 | `notice` | A change was made (or would be, when the message starts with `WhatIf:`) |
-| `warning` | Something was skipped, e.g. a module wasn't found in the repository |
+| `warning` | Something was skipped, e.g. a module wasn't found in the repository, or an old version was kept because another module requires it |
 | `err` | An update or removal failed |
 
 ## User module locations
