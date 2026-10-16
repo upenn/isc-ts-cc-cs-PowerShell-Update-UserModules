@@ -259,6 +259,21 @@ foreach ($cmd in $requiredCommands) {
     }
 }
 
+# AllUsers module folders are only writable when elevated; stop now instead of failing every module.
+if ($Scope -eq 'AllUsers' -and -not $WhatIfPreference) {
+    $elevated = if ($onWindows) {
+        ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+    } else {
+        [string](& id -u) -eq '0'
+    }
+    if (-not $elevated) {
+        $msg = 'AllUsers modules can only be changed from an elevated session (Run as Administrator on Windows, sudo pwsh on macOS/Linux). Use -WhatIf to preview without elevation.'
+        Write-Log $msg -Level ERROR
+        throw $msg
+    }
+}
+
 $scopeRoots = @(Get-ScopedModuleRoots)
 Write-Log "$Scope module roots: $($scopeRoots -join '; ')"
 

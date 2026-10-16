@@ -1,6 +1,6 @@
 @{
     RootModule        = 'Update-UserModules.psm1'
-    ModuleVersion     = '1.0.1'
+    ModuleVersion     = '1.0.2'
     GUID              = '8d7f39fb-bcff-4d6d-a9f7-8f42a28d321e'
     Author            = 'isc-ts-cc-cs'
     Description       = 'Updates CurrentUser or AllUsers PowerShell modules and removes older versions.'
